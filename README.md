@@ -1,14 +1,16 @@
 # aigw-mock-llm
 
-A mock LLM API (Anthropic Messages and OpenAI Chat Completions, Responses and Models) on an AWS Lambda Function URL, for seeing
-exactly what an AI gateway forwards upstream. Point a gateway target at it with `custom_host`, send requests through the gateway,
-and read the CloudWatch log.
+A mock LLM API (Anthropic Messages and OpenAI Chat Completions, Responses and Models) on an AWS Lambda Function URL or in a
+container, for seeing exactly what an AI gateway forwards upstream. Point a gateway target at it with `custom_host`, send
+requests through the gateway, and read the log (CloudWatch, or the container's stdout).
 
 > Lab test tool, not a product. No support. Unofficial.
 
 | Path | What |
 |---|---|
 | `handler/handler.py` | The Lambda (Python stdlib only). Answers canned `ok` replies (JSON, or SSE when `"stream": true`) for the endpoints below, and logs one JSON line per request: header names with masked values, model, metadata, tool names, message block types, body hash, and `leaks` |
+| `handler/server.py` | Serves `handler.py` over plain HTTP (stdlib), for a container or a local run. Same replies and log line |
+| `Dockerfile` | Container image running `server.py` |
 | `infra/` | Terraform for the Lambda, its Function URL, IAM and the log group |
 
 | Provider | Endpoints (after `<URL><token>/v1`) |
@@ -49,6 +51,21 @@ and the URL and token change.
 ```bash
 aws logs tail "$(terraform -chdir=infra output -raw log_group)" --since 10m --format short | grep '"mock": "request"'
 ```
+
+## Run as a container
+
+```bash
+docker build -t aigw-mock-llm .
+MOCK_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
+docker run -d --name aigw-mock-llm -e TOKEN="$MOCK_TOKEN" -e LEAK_NEEDLES="<jwt-sub>,<org-id>" -p 8080:8080 aigw-mock-llm
+curl -s "http://localhost:8080/${MOCK_TOKEN}/v1/messages" -d '{"model":"x"}'
+docker logs -f aigw-mock-llm | grep '"mock": "request"'
+```
+
+`TOKEN` is required; `LEAK_NEEDLES` and `PORT` (default 8080) are optional. `GET /healthz` answers 200 without the token, for
+liveness and readiness probes. The gateway's `custom_host` is `<base-url>/<token>/v1`, where the base URL is whatever reaches the
+container from the gateway (a Kubernetes Service, for example). Plain HTTP: put TLS in front (ingress, load balancer) if the
+gateway needs HTTPS. Without Docker: `cd handler && TOKEN=<secret> python3 server.py`.
 
 ## Test locally
 

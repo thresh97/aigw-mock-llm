@@ -1,7 +1,7 @@
 """Checks the handler locally, without AWS: python3 -m unittest discover tests
 
-The SDK tests (skipped unless `pip install openai anthropic`) serve the handler over local HTTP, call it with the official
-clients, and validate every response and stream event strictly against the SDKs' pydantic models.
+The SDK tests (skipped unless `pip install openai anthropic`) serve the handler over local HTTP with handler/server.py,
+call it with the official clients, and validate every response and stream event strictly against the SDKs' pydantic models.
 """
 
 import io
@@ -10,13 +10,15 @@ import os
 import sys
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from contextlib import redirect_stdout
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import get_args
 
 os.environ.setdefault("TOKEN", "t")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "handler"))
 import handler as h  # noqa: E402
+import server  # noqa: E402
 
 TOKEN = os.environ["TOKEN"]
 
@@ -80,29 +82,29 @@ class Handler(unittest.TestCase):
         self.assertEqual(log["messages"], ["assistant:tool_use=g", "user:tool_result"])
 
 
-class _Lambda(BaseHTTPRequestHandler):
-    """Turns a local HTTP request into a Function URL event."""
-
-    def _serve(self):
-        path, _, query = self.path.partition("?")
-        n = int(self.headers.get("content-length") or 0)
-        ev = {"rawPath": path, "rawQueryString": query, "headers": dict(self.headers.items()),
-              "body": self.rfile.read(n).decode() if n else "",
-              "requestContext": {"http": {"method": self.command, "sourceIp": "127.0.0.1"}}}
-        with redirect_stdout(io.StringIO()):
-            r = h.handler(ev, None)
-        body = r["body"].encode()
-        self.send_response(r["statusCode"])
-        for k, v in r["headers"].items():
-            self.send_header(k, v)
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    do_GET = do_POST = _serve
-
-    def log_message(self, *args):
-        pass
+class Server(unittest.TestCase):
+    def test_http(self):
+        srv = server.serve(0, "127.0.0.1")
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_port}"
+        try:
+            with urllib.request.urlopen(f"{base}/healthz") as r:
+                self.assertEqual((r.status, r.read()), (200, b"ok"))
+            req = urllib.request.Request(f"{base}/{TOKEN}/v1/messages?x=1", data=b'{"model": "m", "stream": true}',
+                                         headers={"x-probe": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig"})
+            out = io.StringIO()
+            with redirect_stdout(out), urllib.request.urlopen(req) as r:
+                self.assertEqual(r.headers["content-type"], "text/event-stream")
+                self.assertIn(b"event: message_stop", r.read())
+            log = json.loads(out.getvalue())
+            self.assertEqual((log["path"], log["query"], log["source_ip"]), ("/v1/messages", "x=1", "127.0.0.1"))
+            self.assertEqual(log["leaks"], ["x-probe: JWT"])
+            with self.assertRaises(urllib.error.HTTPError) as e, redirect_stdout(io.StringIO()):
+                urllib.request.urlopen(f"{base}/wrong/v1/models")
+            self.assertEqual(e.exception.code, 404)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 try:
@@ -117,7 +119,8 @@ except ImportError:
 class SDK(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _Lambda)
+        cls.stdout, sys.stdout = sys.stdout, io.StringIO()  # the handler's log lines
+        cls.server = server.serve(0, "127.0.0.1")
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{cls.server.server_port}/{TOKEN}"
         cls.oai = openai.OpenAI(base_url=f"{base}/v1", api_key="k", max_retries=0)
@@ -126,6 +129,8 @@ class SDK(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
+        sys.stdout = cls.stdout
 
     def validate(self, model, data):
         return TypeAdapter(model).validate_python(data)
