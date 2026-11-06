@@ -1,0 +1,15 @@
+# Deployment-specific, never committed
+infra/terraform.tfvars
+infra/*.auto.tfvars
+infra/backend.tf
+CLAUDE.local.md
+# Workspace project note, not part of the published repo
+aigw-mock-llm.md
+HANDOFF.md
+**/.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+tfplan
+infra/.build/
+__pycache__/
