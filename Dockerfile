@@ -5,6 +5,7 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PORT=8080
 WORKDIR /app
 COPY handler/handler.py handler/server.py ./
+# COPY keeps host file modes; USER 65534 can't read a 600 file. On BuildKit, `COPY --chmod=644` does this without the extra layer.
 RUN chmod 644 handler.py server.py
 USER 65534:65534
 EXPOSE 8080
