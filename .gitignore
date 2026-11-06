@@ -13,3 +13,4 @@ HANDOFF.md
 tfplan
 infra/.build/
 __pycache__/
+.coverage

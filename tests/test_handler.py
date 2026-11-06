@@ -4,11 +4,17 @@ The SDK tests (skipped unless `pip install openai anthropic`) serve the handler 
 call it with the official clients, and validate every response and stream event strictly against the SDKs' pydantic models.
 """
 
+import base64
 import io
 import json
 import os
+import re
+import runpy
+import signal
+import subprocess
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -17,7 +23,8 @@ from unittest import mock
 from typing import get_args
 
 os.environ.setdefault("TOKEN", "t")
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "handler"))
+HANDLER_DIR = os.path.join(os.path.dirname(__file__), "..", "handler")
+sys.path.insert(0, HANDLER_DIR)
 import handler as h  # noqa: E402
 import server  # noqa: E402
 
@@ -49,6 +56,16 @@ class Handler(unittest.TestCase):
         self.assertEqual(call("/v1/messages", {}, token="wrong")[0]["statusCode"], 404)
         self.assertEqual(call("/v1/nope", {})[0]["statusCode"], 404)
         self.assertEqual(call("/v1/models", None, "POST")[0]["statusCode"], 404)
+
+    def test_base64_and_invalid_json_bodies(self):
+        ev = {"rawPath": f"/{TOKEN}/v1/chat/completions", "isBase64Encoded": True,
+              "body": base64.b64encode(json.dumps({"model": "m-error-429"}).encode()).decode(),
+              "requestContext": {"http": {"method": "POST"}}}
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(h.handler(ev, None)["statusCode"], 429)
+            for body in ("not json", "[1, 2]"):
+                r = h.handler(dict(ev, isBase64Encoded=False, body=body), None)
+                self.assertEqual(r["statusCode"], 200)
 
     def test_mock_tokens(self):
         r, _ = call("/v1/chat/completions", {"messages": [{"role": "user", "content": "MOCK_TOKENS=500"}]})
@@ -143,9 +160,43 @@ class Server(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as e, redirect_stdout(io.StringIO()):
                 urllib.request.urlopen(f"{base}/wrong/v1/models")
             self.assertEqual(e.exception.code, 404)
+            e.exception.close()
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_main_serves_on_port_and_exits_on_sigterm(self):
+        out = io.StringIO()
+        close = {"autospec": True, "side_effect": lambda srv: srv.server_close()}
+        with mock.patch.dict(os.environ, {"PORT": "0"}), mock.patch("signal.signal") as sig, \
+                mock.patch("http.server.HTTPServer.serve_forever", **close) as serve_forever, redirect_stdout(out):
+            runpy.run_module("server", run_name="__main__")
+        serve_forever.assert_called_once()
+        self.assertRegex(out.getvalue(), r"^mock listening on :\d+\n$")
+        signum, on_term = sig.call_args[0]
+        self.assertEqual(signum, signal.SIGTERM)
+        with self.assertRaises(SystemExit):
+            on_term(signum, None)
+
+    def test_real_process_serves_delays_and_exits_on_sigterm(self):
+        proc = subprocess.Popen([sys.executable, os.path.join(HANDLER_DIR, "server.py")], stdout=subprocess.PIPE, text=True,
+                                env=dict(os.environ, PORT="0", PYTHONUNBUFFERED="1"))
+        try:
+            port = int(re.search(r":(\d+)$", proc.stdout.readline()).group(1))
+            base = f"http://127.0.0.1:{port}"
+            with urllib.request.urlopen(f"{base}/healthz") as r:
+                self.assertEqual(r.read(), b"ok")
+            started = time.monotonic()
+            with urllib.request.urlopen(urllib.request.Request(
+                    f"{base}/{TOKEN}/v1/chat/completions", data=b'{"model": "m-delay-300"}')) as r:
+                self.assertEqual(r.status, 200)
+            self.assertGreaterEqual(time.monotonic() - started, 0.3)
+            proc.send_signal(signal.SIGTERM)
+            self.assertEqual(proc.wait(timeout=5), 0)
+        finally:
+            proc.kill()
+            proc.wait()
+            proc.stdout.close()
 
 
 try:
@@ -218,6 +269,25 @@ class SDK(unittest.TestCase):
         self.assertEqual(final.output_text, "ok")
         for e, d in self.raw_stream("/v1/responses", {"input": "hi"}):
             self.assertEqual(self.validate_event(openai.types.responses.ResponseStreamEvent, json.loads(d)).type, e)
+
+    def test_simulated_errors_raise_the_sdks_exceptions(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        for status, exc in [(429, openai.RateLimitError), (503, openai.InternalServerError), (401, openai.AuthenticationError)]:
+            with self.assertRaises(exc) as e:
+                self.oai.chat.completions.create(model=f"gpt-4o-error-{status}", messages=msgs)
+            self.assertEqual(e.exception.status_code, status)
+            self.assertIn(f"HTTP {status}", e.exception.message)
+        with self.assertRaises(openai.RateLimitError):
+            self.oai.responses.create(model="gpt-4o-error-429", input="hi")
+        for status, exc in [(429, anthropic.RateLimitError), (529, anthropic.InternalServerError), (401, anthropic.AuthenticationError)]:
+            with self.assertRaises(exc) as e:
+                self.ant.messages.create(model=f"claude-error-{status}", max_tokens=5, messages=msgs)
+            self.assertEqual(e.exception.status_code, status)
+            self.assertIn(f"HTTP {status}", e.exception.message)
+        with self.assertRaises(anthropic.RateLimitError):
+            self.ant.messages.count_tokens(model="claude-error-429", messages=msgs)
+        with self.assertRaises(openai.RateLimitError):  # streaming requests fail before any event is sent
+            self.oai.chat.completions.create(model="gpt-4o-error-429", messages=msgs, stream=True)
 
     def test_openai_models(self):
         self.assertEqual([m.id for m in self.oai.models.list()], ["mock", "mock-large"])
