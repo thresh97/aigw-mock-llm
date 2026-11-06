@@ -13,6 +13,7 @@ import unittest
 import urllib.error
 import urllib.request
 from contextlib import redirect_stdout
+from unittest import mock
 from typing import get_args
 
 os.environ.setdefault("TOKEN", "t")
@@ -54,6 +55,46 @@ class Handler(unittest.TestCase):
         self.assertEqual(json.loads(r["body"])["usage"]["prompt_tokens"], 500)
         r, _ = call("/v1/messages", {"messages": [{"role": "user", "content": "MOCK_TOKENS=7"}]})
         self.assertEqual(json.loads(r["body"])["usage"]["input_tokens"], 7)
+
+    def test_error_from_model_name_or_prompt(self):
+        cases = [("/v1/chat/completions", "gpt-4o-error-429", {"error": {"type": "rate_limit_exceeded", "code": "rate_limit_exceeded"}}),
+                 ("/v1/responses", "gpt-4o-mini-error-503", {"error": {"type": "server_error"}}),
+                 ("/v1/messages", "claude-sonnet-4-5-error-529", {"type": "error", "error": {"type": "overloaded_error"}}),
+                 ("/v1/messages/count_tokens", "claude-error-401", {"error": {"type": "authentication_error"}})]
+        for path, model, want in cases:
+            r, log = call(path, {"model": model, "messages": []})
+            code = int(model[-3:])
+            self.assertEqual(r["statusCode"], code)
+            body = json.loads(r["body"])
+            for k, v in want.items():
+                self.assertEqual(body[k] if not isinstance(v, dict) else {x: body[k][x] for x in v}, v)
+            self.assertEqual(log["simulate"], {"delay_s": 0, "error": code})
+        r, _ = call("/v1/chat/completions", {"model": "gpt-4o", "messages": [{"role": "user", "content": "MOCK_ERROR=500"}]})
+        self.assertEqual(r["statusCode"], 500)
+        r, _ = call("/v1/chat/completions", {"model": "gpt-4o-error-429", "messages": [{"role": "user", "content": "MOCK_ERROR=502"}]})
+        self.assertEqual(r["statusCode"], 502)  # the prompt wins
+        for model in ("gpt-4o", "gpt-4-0613", "claude-3-5-sonnet-20241022", "terror-429", "x-error-200"):
+            self.assertEqual(call("/v1/chat/completions", {"model": model, "messages": []})[0]["statusCode"], 200)
+
+    def test_delay(self):
+        with mock.patch.object(h.time, "sleep") as sleep:
+            call("/v1/chat/completions", {"model": "m-delay-1500", "messages": []})
+            sleep.assert_called_once_with(1.5)
+            sleep.reset_mock()
+            _, log = call("/v1/messages", {"model": "m", "messages": [{"role": "user", "content": "MOCK_DELAY=100-200"}]})
+            (secs,), _ = sleep.call_args
+            self.assertTrue(0.1 <= secs <= 0.2)
+            self.assertEqual(log["simulate"]["delay_s"], secs)
+            sleep.reset_mock()
+            call("/v1/messages", {"model": "m-delay-300-100", "messages": []})  # reversed range
+            self.assertTrue(0.1 <= sleep.call_args[0][0] <= 0.3)
+            sleep.reset_mock()
+            r, log = call("/v1/chat/completions", {"model": "m-delay-250-error-503", "messages": []})  # both: delay, then error
+            sleep.assert_called_once_with(0.25)
+            self.assertEqual(r["statusCode"], 503)
+            sleep.reset_mock()
+            call("/v1/chat/completions", {"model": "m", "messages": []})
+            sleep.assert_not_called()
 
     def test_chat_stream_usage_only_when_requested(self):
         for opts, want in [({}, 0), ({"stream_options": {"include_usage": True}}, 1)]:

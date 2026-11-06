@@ -8,12 +8,16 @@ Logs one JSON line per request to CloudWatch: header names with masked values, t
 block types and a body hash (for guardrail-edit tests), and "leaks": identity-provider data found in headers or body
 (JWT-shaped strings, plus env LEAK_NEEDLES, comma-separated).
 MOCK_TOKENS=<n> anywhere in the body sets the reported input tokens, so one request can exhaust a gateway usage limit.
+Failure simulation, for routing, fallback and load-balancing tests: MOCK_ERROR=<status> and MOCK_DELAY=<ms> or <min>-<max> ms
+(random per request) anywhere in the body, or `-error-<status>` / `-delay-<ms>[-<max>]` in the model name (gpt-4o-error-429,
+claude-sonnet-4-5-delay-500-2000-error-503). The body wins over the model name. The delay runs first, then the error, if any.
 """
 
 import base64
 import hashlib
 import json
 import os
+import random
 import re
 import time
 import uuid
@@ -21,6 +25,15 @@ import uuid
 TOKEN = os.environ["TOKEN"]
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")
 TOKENS_RE = re.compile(r"MOCK_TOKENS=(\d+)")
+ERROR_RE = re.compile(r"MOCK_ERROR=([45]\d\d)")
+DELAY_RE = re.compile(r"MOCK_DELAY=(\d+)(?:-(\d+))?")
+MODEL_ERROR_RE = re.compile(r"(?:^|-)error-([45]\d\d)(?=-|$)")
+MODEL_DELAY_RE = re.compile(r"(?:^|-)delay-(\d+)(?:-(\d+))?(?=-|$)")
+# status -> (Anthropic error type, OpenAI error type); other 4xx/5xx get api_error / server_error
+ERROR_TYPES = {400: ("invalid_request_error", "invalid_request_error"), 401: ("authentication_error", "invalid_request_error"),
+               403: ("permission_error", "invalid_request_error"), 404: ("not_found_error", "invalid_request_error"),
+               413: ("request_too_large", "invalid_request_error"), 429: ("rate_limit_error", "rate_limit_exceeded"),
+               529: ("overloaded_error", "server_error")}
 NEEDLES = ["keycloak", "portkey_oid", "portkey_workspace"] + [n for n in os.environ.get("LEAK_NEEDLES", "").split(",") if n]
 
 
@@ -61,6 +74,26 @@ def reply(code, obj, ctype="application/json"):
 def not_found(message):
     # Carries both the Anthropic and the OpenAI error fields so either client parses it.
     return reply(404, {"type": "error", "error": {"type": "not_found_error", "code": "not_found", "message": message}})
+
+
+def behavior(req, body):
+    """(delay in seconds, error status or None) from the body (MOCK_*) or, failing that, the model name."""
+    model = req.get("model") if isinstance(req.get("model"), str) else ""
+    e = ERROR_RE.search(body) or MODEL_ERROR_RE.search(model)
+    d = DELAY_RE.search(body) or MODEL_DELAY_RE.search(model)
+    delay = 0
+    if d:
+        lo, hi = sorted((int(d.group(1)), int(d.group(2) or d.group(1))))
+        delay = random.randint(lo, hi) / 1000
+    return delay, int(e.group(1)) if e else None
+
+
+def error(code, anthropic):
+    kind = ERROR_TYPES.get(code, ("api_error", "server_error"))[0 if anthropic else 1]
+    msg = f"mock: simulated HTTP {code}"
+    if anthropic:
+        return reply(code, {"type": "error", "error": {"type": kind, "message": msg}})
+    return reply(code, {"error": {"message": msg, "type": kind, "param": None, "code": kind}})
 
 
 def sse(events):
@@ -145,6 +178,7 @@ def handler(event, context):
     except ValueError:
         req = {}
     req = req if isinstance(req, dict) else {}
+    delay, status = behavior(req, body)
     msgs = req.get("messages") if isinstance(req.get("messages"), list) else req.get("input")
     print(json.dumps({"mock": "request", "method": http.get("method"),
                       "path": path, "query": event.get("rawQueryString"), "source_ip": http.get("sourceIp"),
@@ -153,8 +187,13 @@ def handler(event, context):
                       "stream": req.get("stream"), "body_sha256": hashlib.sha256(body.encode()).hexdigest()[:16],
                       "tools": [tool_name(t) for t in req["tools"] if isinstance(t, dict)] if isinstance(req.get("tools"), list) else None,
                       "tool_choice": req.get("tool_choice"),
+                      "simulate": {"delay_s": delay, "error": status},
                       "messages": [blocks(m) for m in msgs or [] if isinstance(m, dict)] if isinstance(msgs, list) else None}))
 
+    if delay:
+        time.sleep(delay)
+    if status and path.endswith(("/messages", "/messages/count_tokens", "/chat/completions", "/responses")):
+        return error(status, path.endswith(("/messages", "/messages/count_tokens")))
     m = TOKENS_RE.search(body)
     tokens = int(m.group(1)) if m else 10
     if path.endswith("/messages/count_tokens"):

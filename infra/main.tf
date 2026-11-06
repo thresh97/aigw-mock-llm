@@ -25,6 +25,12 @@ variable "leak_needles" {
   default = ""
 }
 
+# Lambda timeout in seconds; must exceed the longest MOCK_DELAY / -delay-<ms> you test with.
+variable "timeout" {
+  type    = number
+  default = 60
+}
+
 provider "aws" {
   region = var.aws_region
   default_tags {
@@ -70,7 +76,7 @@ resource "aws_lambda_function" "mock" {
   handler          = "handler.handler"
   filename         = data.archive_file.mock.output_path
   source_code_hash = data.archive_file.mock.output_base64sha256
-  timeout          = 10
+  timeout          = var.timeout
   memory_size      = 128
 
   environment {

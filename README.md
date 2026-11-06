@@ -23,6 +23,30 @@ requests through the gateway, and read the log (CloudWatch, or the container's s
 tokens (`input_tokens` / `prompt_tokens`), for exhausting gateway usage limits. Requests whose path doesn't start with the secret
 token get a 404.
 
+## Simulate errors and delays
+
+For routing, fallback and load-balancing demos: pick the behavior with the model name (so each gateway target or route can
+point at its own fake model) or with a directive in the prompt (per request). Works on every inference endpoint.
+
+| Directive | Model name | Anywhere in the request body | Effect |
+|---|---|---|---|
+| Error | `-error-<status>` | `MOCK_ERROR=<status>` | Answers that 4xx/5xx instead of `ok`, in the provider's error format (`rate_limit_error` / `rate_limit_exceeded` for 429, `overloaded_error` for Anthropic 529, ...) |
+| Fixed delay | `-delay-<ms>` | `MOCK_DELAY=<ms>` | Waits that long before answering |
+| Random delay | `-delay-<min>-<max>` | `MOCK_DELAY=<min>-<max>` | Waits a random time in the range, drawn per request |
+
+```bash
+# well-known names with a suffix, so they look right in gateway config and metrics
+gpt-4o-error-429                       claude-sonnet-4-5-error-529
+gpt-4o-delay-2000                      claude-sonnet-4-5-delay-500-3000
+gpt-4o-mini-delay-1000-5000-error-503  # delay, then error
+# or per request
+curl -s "$URL${MOCK_TOKEN}/v1/chat/completions" -d '{"model":"gpt-4o","messages":[{"role":"user","content":"MOCK_DELAY=100-800 MOCK_ERROR=503"}]}'
+```
+
+The prompt wins over the model name. The delay runs first, then the error, if any. The log line's `simulate` field shows what was
+applied (`delay_s`, `error`). On Lambda, set `timeout` (seconds, default 60) above your longest delay: `terraform apply -var timeout=120`.
+A delay longer than the gateway's `request_timeout` tests the gateway's timeout handling.
+
 ## Deploy
 
 ```bash
